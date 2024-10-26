@@ -9,6 +9,7 @@ use std::ascii::AsciiExt;
 
 #[cfg(feature = "percent-encode")]
 use percent_encoding::percent_decode;
+use time::error::InvalidVariant;
 use time::{PrimitiveDateTime, Duration, OffsetDateTime};
 use time::{parsing::Parsable, macros::format_description, format_description::FormatItem};
 
@@ -31,6 +32,8 @@ pub enum ParseError {
     EmptyName,
     /// Decoding the cookie's name or value resulted in invalid UTF-8.
     Utf8Error(Utf8Error),
+    /// The year cannot be less than 1601. RFC 6265, Page 15
+    InvalidYear,
 }
 
 impl ParseError {
@@ -41,7 +44,8 @@ impl ParseError {
             ParseError::EmptyName => "the cookie's name is empty",
             ParseError::Utf8Error(_) => {
                 "decoding the cookie's name or value resulted in invalid UTF-8"
-            }
+            },
+            ParseError::InvalidYear => "the year cannot be less than 1601"
         }
     }
 }
@@ -199,6 +203,15 @@ fn parse_inner<'c>(s: &str, decode: bool) -> Result<Cookie<'c>, ParseError> {
                 if let Ok(time) = tm {
                     cookie.expires = Some(time.into())
                 }
+
+                match tm {
+                    Ok(time) => {
+                        cookie.expires = Some(time.into())
+                    }
+                    Err(_) => {
+                        return Err(ParseError::InvalidYear)
+                    },
+                }
             }
             _ => {
                 // We're going to be permissive here. If we have no idea what
@@ -225,13 +238,20 @@ pub(crate) fn parse_date(s: &str, format: &impl Parsable) -> Result<OffsetDateTi
     // Parse. Handle "abbreviated" dates like Chromium. See cookie#162.
     let mut date = format.parse(s.as_bytes())?;
     if let Some(y) = date.year().or_else(|| date.year_last_two().map(|v| v as i32)) {
+        // RFC 6265, Page 15
         let offset = match y {
-            0..=68 => 2000,
-            69..=99 => 1900,
+            0..=69 => 2000,
+            70..=99 => 1900,
             _ => 0,
         };
 
-        date.set_year(y + offset);
+        let year = y + offset;
+        // RFC 6265, Page 15
+        if year < 1601 {
+            return Err(time::Error::InvalidVariant(InvalidVariant));
+        }
+
+        date.set_year(year);
     }
 
     Ok(PrimitiveDateTime::try_from(date)?.assume_utc())
@@ -240,7 +260,7 @@ pub(crate) fn parse_date(s: &str, format: &impl Parsable) -> Result<OffsetDateTi
 #[cfg(test)]
 mod tests {
     use super::parse_date;
-    use crate::{Cookie, SameSite};
+    use crate::{Cookie, ParseError, SameSite};
     use time::Duration;
 
     macro_rules! assert_eq_parse {
@@ -439,7 +459,7 @@ mod tests {
 
         let cookie_str = "foo=bar; expires=Thu, 10-Sep-69 20:00:00 GMT";
         let cookie = Cookie::parse(cookie_str).unwrap();
-        assert_eq!(cookie.expires_datetime().unwrap().year(), 1969);
+        assert_eq!(cookie.expires_datetime().unwrap().year(), 2069);
 
         let cookie_str = "foo=bar; expires=Thu, 10-Sep-99 20:00:00 GMT";
         let cookie = Cookie::parse(cookie_str).unwrap();
@@ -448,6 +468,26 @@ mod tests {
         let cookie_str = "foo=bar; expires=Thu, 10-Sep-2069 20:00:00 GMT";
         let cookie = Cookie::parse(cookie_str).unwrap();
         assert_eq!(cookie.expires_datetime().unwrap().year(), 2069);
+
+        let cookie_str = "foo=bar; expires=Thu, 10-Sep-0 20:00:00 GMT";
+        let cookie = Cookie::parse(cookie_str).unwrap();
+        assert_eq!(cookie.expires_datetime().unwrap().year(), 2000);
+
+        let cookie_str = "foo=bar; expires=Thu, 10-Sep-00 20:00:00 GMT";
+        let cookie = Cookie::parse(cookie_str).unwrap();
+        assert_eq!(cookie.expires_datetime().unwrap().year(), 2000);
+
+        let cookie_str = "foo=bar; expires=Thu, 10-Sep-70 20:00:00 GMT";
+        let cookie = Cookie::parse(cookie_str).unwrap();
+        assert_eq!(cookie.expires_datetime().unwrap().year(), 1970);
+
+        let cookie_str = "foo=bar; expires=Thu, 10-Sep-1601 20:00:00 GMT";
+        let cookie = Cookie::parse(cookie_str).unwrap();
+        assert_eq!(cookie.expires_datetime().unwrap().year(), 1601);
+
+        let cookie_str = "foo=bar; expires=Thu, 10-Sep-1600 20:00:00 GMT";
+        let result = Cookie::parse(cookie_str).map_err(|e| e.to_string());
+        assert_eq!(Err(ParseError::InvalidYear.to_string()), result);
     }
 
     #[test]
